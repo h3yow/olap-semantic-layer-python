@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
+
+from .errors import ModelError, UnknownMeasureError
 
 
 class Aggregation(str, Enum):
@@ -59,13 +61,68 @@ class MeasureRegistry:
         self._derived: dict[str, DerivedMeasure] = {}
 
     def register(self, measure: Measure) -> None:
-        raise NotImplementedError
+        if measure.name in self._measures or measure.name in self._derived:
+            raise ModelError(f"度量重复定义: {measure.name}")
+        if measure.aggregation is Aggregation.ENDING_BALANCE and not measure.time_column:
+            raise ModelError(
+                f"期末余额度量 {measure.name} 必须声明 time_column",
+                detail={"measure": measure.name})
+        self._measures[measure.name] = measure
 
     def register_derived(self, derived: DerivedMeasure) -> None:
-        raise NotImplementedError
+        if derived.name in self._measures or derived.name in self._derived:
+            raise ModelError(f"度量重复定义: {derived.name}")
+        for dep in derived.dependencies:
+            if dep not in self._measures and dep not in self._derived:
+                raise ModelError(
+                    f"派生度量 {derived.name} 依赖未定义的度量: {dep}",
+                    detail={"derived": derived.name, "dependency": dep})
+        # 循环依赖检测
+        if self._has_cycle(derived.name, derived.dependencies):
+            raise ModelError(f"派生度量 {derived.name} 存在循环依赖")
+        self._derived[derived.name] = derived
+
+    def _has_cycle(self, name: str, deps: tuple[str, ...]) -> bool:
+        seen: set[str] = set()
+
+        def visit(n: str, stack: set[str]) -> bool:
+            if n in stack:
+                return True
+            d = self._derived.get(n)
+            if d is None:
+                return False
+            return any(visit(x, stack | {n}) for x in d.dependencies)
+
+        return any(visit(d, {name}) for d in deps)
 
     def get(self, name: str) -> Measure | DerivedMeasure:
-        raise NotImplementedError
+        m = self._measures.get(name) or self._derived.get(name)
+        if m is None:
+            raise UnknownMeasureError(f"未定义的度量: {name}", detail={"measure": name})
+        return m
 
     def lineage(self, name: str, output_column: str | None = None) -> Lineage:
-        raise NotImplementedError
+        """追溯任一结果列到底层 表.列 与口径版本。"""
+        base: list[str] = []
+        via: list[str] = []
+        versions: list[str] = []
+
+        def walk(n: str) -> None:
+            m = self.get(n)
+            via.append(n)
+            if isinstance(m, Measure):
+                col = f"{m.table}.{m.column}"
+                if col not in base:
+                    base.append(col)
+            else:
+                versions.append(f"{n}@{m.definition_version}")
+                for dep in m.dependencies:
+                    walk(dep)
+
+        walk(name)
+        return Lineage(
+            output_column=output_column or name,
+            base_columns=tuple(base),
+            via_measures=tuple(via),
+            definition_version="+".join(versions) if versions else "base",
+        )
