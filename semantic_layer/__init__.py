@@ -12,8 +12,10 @@ from .errors import (
     QueryLimitError,
     RefreshError,
     SemanticLayerError,
+    UnknownDimensionError,
+    UnknownMeasureError,
 )
-from .limits import LimitPolicy, QueryLimits
+from .limits import LimitEnforcer, LimitPolicy, QueryLimits
 from .materialization import MaterializedAggregate, RefreshReport
 from .measures import Aggregation, DerivedMeasure, Lineage, Measure, MeasureRegistry
 from .model import Cardinality, Column, Join, SemanticModel, Table, TableKind
@@ -24,9 +26,10 @@ __all__ = [
     "Aggregation", "AmbiguousJoinPathError", "Cardinality", "Column",
     "ConcurrentRefreshError", "DerivedMeasure", "DimensionHistory",
     "DimensionVersion", "Engine", "FanoutError", "GrainMismatchError",
-    "Join", "LimitPolicy", "Lineage", "MaterializedAggregate", "Measure",
+    "Join", "LimitEnforcer", "LimitPolicy", "Lineage", "MaterializedAggregate", "Measure",
     "MeasureRegistry", "ModelError", "NoJoinPathError",
     "NonAdditiveAggregationError", "QueryLimitError", "QueryLimits",
     "QueryResult", "QuerySpec", "RefreshError", "RefreshReport",
     "SemanticLayerError", "SemanticModel", "Table", "TableKind",
+    "UnknownDimensionError", "UnknownMeasureError",
 ]
