@@ -54,3 +54,39 @@ def test_ingest_idempotent(client):
     assert client.post("/ingest", json=payload).json()["written"] is True
     log.info("输入: 同 batch 重复提交；判定依据: written=False（幂等）")
     assert client.post("/ingest", json=payload).json()["written"] is False
+
+
+def test_release_and_version_read_api(client):
+    # 通过整体发布连续发布 4 个版本（默认留存上限 3），最旧版本应被淘汰
+    client.post("/ingest", json={
+        "table": "fact_sales", "partition": "2026-04-30", "batch_id": "api-rel",
+        "rows": [{"id": 950, "cust_id": "c9", "day": "2026-04-01",
+                  "amount": 7.0, "cost": 2.0, "__row_key__": "api-rel-1"}]})
+    for v in ("1", "2", "3", "4"):
+        res = client.post("/release", json={
+            "release_id": f"api-rel-{v}",
+            "target_versions": {"revenue_by_region": v},
+            "partitions": ["2026-04-01"]})
+        assert res.status_code == 200, res.json()
+    log.info("输入: 连续发布 4 版（上限 3）；判定依据: 版本1被淘汰")
+    versions = client.get("/materialization/revenue_by_region/versions").json()
+    assert versions["current"] == "4"
+    assert versions["retained"] == ["2", "3", "4"]
+
+    log.info("判定依据: 已淘汰版本 HTTP 410 version_evicted；"
+             "从未发布版本 HTTP 404 version_not_found；二者可区分")
+    res = client.get("/materialization/revenue_by_region?version=1")
+    assert res.status_code == 410
+    assert res.json()["error"]["code"] == "version_evicted"
+    res = client.get("/materialization/revenue_by_region?version=99")
+    assert res.status_code == 404
+    assert res.json()["error"]["code"] == "version_not_found"
+
+    # 保留范围内版本完整可取；重复发布幂等
+    assert client.get(
+        "/materialization/revenue_by_region?version=4").status_code == 200
+    rep = client.post("/release", json={
+        "release_id": "api-rel-4",
+        "target_versions": {"revenue_by_region": "4"},
+        "partitions": ["2026-04-01"]}).json()
+    assert rep["skipped"] is True

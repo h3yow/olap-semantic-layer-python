@@ -94,6 +94,9 @@ class IngestRequest(BaseModel):
 _ERROR_STATUS = {
     "concurrent_refresh": 409,
     "query_limit_exceeded": 422,
+    "version_not_found": 404,
+    "version_evicted": 410,
+    "non_additive_aggregation": 422,
 }
 
 
@@ -159,6 +162,39 @@ def refresh(req: RefreshRequest):
 @app.get("/materialization/{name}")
 def read_materialization(name: str, version: str | None = None):
     return {"rows": engine.materializations.read(name, version=version)}
+
+
+class ReleaseRequest(BaseModel):
+    release_id: str
+    target_versions: dict[str, str]
+    partitions: list[str]
+
+
+@app.post("/release")
+def publish_release(req: ReleaseRequest):
+    """整体发布：一批目标在同一次发布里原子切换到各自新版本。"""
+    parts = [date.fromisoformat(p) for p in req.partitions]
+    report = engine.materializations.publish_release(
+        req.release_id, req.target_versions, parts)
+    return {
+        "release_id": report.release_id,
+        "target_versions": report.target_versions,
+        "partitions": [str(p) for p in report.partitions],
+        "skipped": report.skipped,
+    }
+
+
+@app.get("/materialization/{name}/versions")
+def list_versions(name: str):
+    mgr = engine.materializations
+    return {"current": mgr.current_version(name),
+            "retained": mgr.versions(name)}
+
+
+@app.post("/materialization/{name}/protect/{version}")
+def protect_version(name: str, version: str):
+    engine.materializations.protect_version(name, version)
+    return {"protected": version}
 
 
 @app.get("/lineage/{measure}")

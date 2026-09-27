@@ -63,6 +63,50 @@ uv run fastapi dev main.py   # 启动 HTTP 入口
 - 物化结果每行带 `__version__`；口径变化后以新版本重刷，
   历史结果按版本可区分、可复现（`read(name, version=...)`）。
 
+### 版本留存与淘汰
+
+同一物化目标并行保留多套口径版本（`VersionedResultStore`），
+由 `RetentionPolicy(max_versions, protected)` 控制：
+
+- **互不覆盖**：口径调整后以新版本重刷/发布，历史版本独立开槽保留；
+  按旧版本取回的结果与当时发布时逐行一致（分组、分区、数值相同）。
+- **淘汰规则**：版本数超过 `max_versions` 时淘汰**最旧的非保护版本**；
+  当前最新版本永不淘汰。`protect_version(name, version)` 把已锁定对外的
+  口径标记为保护，不参与淘汰；若其余版本全部受保护，则允许暂时超限
+  （留存让位于可审计性）。
+- **明确拒绝**：被淘汰的版本留下墓碑，再访问报 `version_evicted`
+  （HTTP 410，"曾发布但已超期"），与 `version_not_found`
+  （HTTP 404，"从未发布"）明确区分，绝不悄悄返回空结果。
+- **并发安全**：发布/淘汰与读取互斥，读取拿到完整版本快照；
+  淘汰不影响仍在保留范围内的版本。
+
+### 口径变更的兼容范围（整体发布）
+
+基础度量口径变化时，用 `publish_release(release_id, {target: version}, partitions)`
+把受影响的全部目标（含派生结果）在**同一次发布**里切换：
+
+- **原子切换**：全部目标基于同一个一致快照计算，全部算完才在同一临界区
+  切换各目标的当前版本指针；读者在任何时刻要么看到变更前完整一套，
+  要么看到变更后完整一套（`read_current_set(names)` 原子读取一组目标）。
+- **幂等与重试**：同一 `release_id` 重复提交直接跳过（`skipped=true`）；
+  任一目标计算失败则整体不提交、不留残留版本，可用新 `release_id`
+  安全重试，结果与从头全量重算一致。
+- **兼容边界**：口径变更只通过"新版本发布"生效；已发布的历史版本
+  内容永不被改写，改写历史口径的唯一途径是发布新版本并（可选）
+  淘汰旧版本。
+
+## 不可加度量的派生约束
+
+- `count_distinct`、`ending_balance`（及传递依赖它们的派生度量）**不得**
+  出现在派生表达式的加/减/取负运算数中——那等价于按普通求和/相减推导。
+  定义期（`register_derived`）、查询规划期与物化注册期三道防线都会在
+  **出结果前**拒绝，报 `non_additive_aggregation`（HTTP 422），
+  与 `unknown_measure`、`grain_mismatch` 明确区分。
+- 乘除（比率/缩放）合法：如 `rev_per_buyer = revenue / buyers`，
+  分子分母都在查询粒度上从明细重算，结果与明细全量重算一致。
+- 可加度量（`sum`/`count`/`min`/`max`）的派生与重聚合不受限，
+  物化结果与明细全量重算一致（有测试对照）。
+
 ## 限额与降级
 
 `QueryLimits(max_scan_rows, max_result_rows, max_joined_rows, policy)`：
@@ -82,14 +126,18 @@ uv run fastapi dev main.py   # 启动 HTTP 入口
 | `unknown_measure` / `unknown_dimension` | 引用未定义对象 |
 | `non_additive_aggregation` | 不可加度量被按求和推导 |
 | `query_limit_exceeded` | 超出代价/规模上限 |
-| `concurrent_refresh` / `refresh_error` | 刷新冲突 / 刷新失败 |
+| `concurrent_refresh` / `refresh_error` | 刷新/发布冲突 / 刷新失败 |
+| `version_not_found` / `version_evicted` | 口径版本从未发布 / 已被留存策略淘汰 |
 
 ## 验证方法
 
 ```bash
-uv run pytest -q                 # 35 项测试
+uv run pytest -q                 # 52 项测试
 uv run pytest tests/test_scd.py  # 维度变更与迟到数据
 uv run pytest tests/test_materialization.py  # 并发刷新与失败原子性
+uv run pytest tests/test_versions.py  # 版本留存、淘汰与明确拒绝
+uv run pytest tests/test_release.py   # 整体发布的原子切换与失败重试
+uv run pytest tests/test_non_additive.py  # 不可加度量派生约束
 ```
 
 测试日志（`test.evidence`）逐条打印每个用例的**输入**与**判定依据**，
