@@ -67,6 +67,8 @@ class QueryPlanner:
             if isinstance(m, Measure):
                 base.append(m)
             else:
+                # 出结果前的口径防线：不可加度量被加减推导的派生一律拒绝
+                self.measures.validate_derivable(name)
                 derived.append(m)
                 for dep in m.dependencies:
                     dm = self.measures.get(dep)
