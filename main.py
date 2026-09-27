@@ -23,6 +23,7 @@ from semantic_layer import (
     MaterializedAggregate,
     Measure,
     MeasureRegistry,
+    PublishItem,
     QueryLimitError,
     QuerySpec,
     SemanticLayerError,
@@ -84,6 +85,16 @@ class RefreshRequest(BaseModel):
     batch_id: str
 
 
+class PublishItemModel(BaseModel):
+    target: str
+    partitions: list[str]
+
+
+class PublishRequest(BaseModel):
+    release_id: str
+    items: list[PublishItemModel]
+
+
 class IngestRequest(BaseModel):
     table: str
     partition: str
@@ -94,6 +105,8 @@ class IngestRequest(BaseModel):
 _ERROR_STATUS = {
     "concurrent_refresh": 409,
     "query_limit_exceeded": 422,
+    "version_not_found": 404,
+    "version_evicted": 410,
 }
 
 
@@ -159,6 +172,25 @@ def refresh(req: RefreshRequest):
 @app.get("/materialization/{name}")
 def read_materialization(name: str, version: str | None = None):
     return {"rows": engine.materializations.read(name, version=version)}
+
+
+@app.get("/materialization/{name}/versions")
+def materialization_versions(name: str):
+    return engine.materializations.versions(name)
+
+
+@app.post("/publish")
+def publish(req: PublishRequest):
+    items = [PublishItem(it.target, tuple(date.fromisoformat(p)
+                                          for p in it.partitions))
+             for it in req.items]
+    report = engine.materializations.publish(req.release_id, items)
+    return {
+        "release_id": report.release_id,
+        "targets_published": report.targets_published,
+        "versions": report.versions,
+        "skipped": report.skipped,
+    }
 
 
 @app.get("/lineage/{measure}")

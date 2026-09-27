@@ -67,6 +67,8 @@ class QueryPlanner:
             if isinstance(m, Measure):
                 base.append(m)
             else:
+                # 查询期防线：派生表达式在出结果前重新校验可加性约束
+                self.measures.validate_derived(m)
                 derived.append(m)
                 for dep in m.dependencies:
                     dm = self.measures.get(dep)
