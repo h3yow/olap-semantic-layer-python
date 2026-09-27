@@ -107,3 +107,19 @@ class BackfillError(RefreshError):
 
 class VersionError(SemanticLayerError):
     code = "version_error"
+
+
+class VersionNotFoundError(VersionError):
+    """请求的口径版本从未发布过（查无此版本）。"""
+
+    code = "version_not_found"
+
+
+class VersionEvictedError(VersionError):
+    """请求的口径版本曾发布，但已被留存策略淘汰，无法原样取回。
+
+    与 version_not_found 明确区分：调用方可据此判断是“从未存在”
+    还是“存在过但已超期淘汰”。
+    """
+
+    code = "version_evicted"

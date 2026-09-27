@@ -14,6 +14,9 @@ from .errors import (
     SemanticLayerError,
     UnknownDimensionError,
     UnknownMeasureError,
+    VersionError,
+    VersionEvictedError,
+    VersionNotFoundError,
 )
 from .limits import LimitEnforcer, LimitPolicy, QueryLimits
 from .materialization import MaterializedAggregate, RefreshReport
@@ -21,6 +24,7 @@ from .measures import Aggregation, DerivedMeasure, Lineage, Measure, MeasureRegi
 from .model import Cardinality, Column, Join, SemanticModel, Table, TableKind
 from .query import QueryResult, QuerySpec
 from .scd import DimensionHistory, DimensionVersion
+from .versions import RetentionPolicy, VersionedResultStore
 
 __all__ = [
     "Aggregation", "AmbiguousJoinPathError", "Cardinality", "Column",
@@ -30,6 +34,8 @@ __all__ = [
     "MeasureRegistry", "ModelError", "NoJoinPathError",
     "NonAdditiveAggregationError", "QueryLimitError", "QueryLimits",
     "QueryResult", "QuerySpec", "RefreshError", "RefreshReport",
-    "SemanticLayerError", "SemanticModel", "Table", "TableKind",
-    "UnknownDimensionError", "UnknownMeasureError",
+    "RetentionPolicy", "SemanticLayerError", "SemanticModel", "Table",
+    "TableKind", "UnknownDimensionError", "UnknownMeasureError",
+    "VersionError", "VersionEvictedError", "VersionNotFoundError",
+    "VersionedResultStore",
 ]
