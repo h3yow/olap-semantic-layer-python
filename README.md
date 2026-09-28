@@ -34,6 +34,17 @@ uv run fastapi dev main.py   # 启动 HTTP 入口
   （与 `unknown_measure`、`model_error` 可区分）；乘除与常量运算不受限，
   如 `revenue / buyers` 合法（其结果同样不可加，下游不得再对其求和/相减）。
   可加度量按既有口径可重新聚合：物化结果跨分区求和与明细全量重算一致。
+- **派生结果参与物化/发布**：`MaterializedAggregate` 的 `measure` 可以给
+  `Measure`，也可以直接给注册表里的度量名字符串（含派生度量，如
+  `"profit"`）。派生目标**按注册的派生定义与真实依赖**出数，不允许、也
+  不需要另写一套独立算法：同一批发布中被依赖目标的结果优先取用，依赖目标
+  排在派生目标之前按依赖拓扑计算；批内没有的依赖从同一一致快照的明细按
+  相同分组重算。派生目标要求其依赖与自身同处一个事实表、相同分组与分区
+  口径，否则在出数前报 `grain_mismatch`。
+  沿依赖链不可加的派生定义（如 `revenue / buyers`）不得注册为物化目标，
+  注册即在出数前被拒（`non_additive_aggregation`），与“这个指标没有
+  定义”（`unknown_measure`）和“连接或粒度规则不成立”
+  （`no_join_path` / `grain_mismatch`）明确区分。
 
 ## 查询语义
 
@@ -77,6 +88,13 @@ uv run fastapi dev main.py   # 启动 HTTP 入口
 - `RetentionPolicy(max_versions, protected)` 配置留存上限与保护名单
   （默认不限）。超出上限时淘汰**最旧的非保护版本**；保护名单与当前对外
   版本永不淘汰（保护优先于上限）。
+- **发布后锁定**：版本不必在创建留存策略时提前列入名单——版本发布完成后
+  随时可调 `protect_version(target, version)`（HTTP
+  `POST /materialization/{name}/protect`）把它锁定为月度审计受保护版本。
+  锁定后无论再发布多少版都不会被淘汰；超过留存上限时只淘汰最旧的、
+  既不在策略名单也未被锁定的版本；若现存版本全部受保护，则实际留存数
+  可以超过上限，一个都不淘汰。重复锁定幂等。锁定已淘汰版本报
+  `version_evicted`，锁定从未发布的版本报 `version_not_found`。
 - 被淘汰的版本读取时报 `version_evicted`（HTTP 410），detail 含淘汰原因；
   从未发布的版本报 `version_not_found`（HTTP 404）；留存版本即使无行也
   正常返回空列表——三者明确区分，不会悄悄返回空结果。
@@ -87,12 +105,21 @@ uv run fastapi dev main.py   # 启动 HTTP 入口
 ### 原子发布（依赖整体切换）
 
 - `publish(release_id, [PublishItem(target, partitions), ...])`：基础度量
-  口径变化时，依赖它的多个物化目标在同一次发布里整体切换到各自注册的
-  新版本。读者（含 `read_set` 多目标原子读）在任何时刻要么看到发布前的
-  完整一套，要么看到发布后的完整一套，不会读到半新半旧。
+  口径变化时，依赖它的多个物化目标（含 `profit = revenue - cost` 这类
+  派生目标）在同一次发布里整体切换到各自注册的新版本。批内目标按依赖
+  拓扑先算被依赖者，派生目标取批内同版本依赖结果，保证口径一致、不另算；
+  读者（含 `read_set` 多目标原子读）在任何时刻要么看到发布前的完整一套，
+  要么看到发布后的完整一套，不会读到半新半旧。同一目标在发布中重复出现
+  时分区取并集。切换前已对外发布的结果之后仍可按旧版本（`read(name,
+  version=...)`）逐行原样取回。
 - 同一 `release_id` 重复发布幂等跳过（`skipped=true`）；任一目标计算失败
   则整体不生效、不残留部分更新，可用同一 `release_id` 安全重试，最终结果
   与从头全量重算一致。
+- **提交阶段失败也整批不生效**：发布在任何状态变更之前先做逐路预检
+  （提交瞬间在同一把锁下再校验一次）。只要有一路的版本已超出留存窗口
+  （`version_evicted`），整批都不会切换——前面的路不会先切到新版本、
+  失败重试也不会残留半成品；已有可读结果保持原样。单目标 `refresh`
+  对已淘汰版本号同样在提交前拒绝。
 - 发布与单目标刷新互斥（`concurrent_refresh`，HTTP 409）。
 
 ## 限额与降级
@@ -112,21 +139,38 @@ uv run fastapi dev main.py   # 启动 HTTP 入口
 | `grain_mismatch` | 跨事实表粒度无法对齐 |
 | `fanout_detected` | 连接会放大事实行 |
 | `unknown_measure` / `unknown_dimension` | 引用未定义对象 |
-| `non_additive_aggregation` | 不可加度量被按求和推导 |
+| `non_additive_aggregation` | 不可加度量被按求和推导（含不可加派生注册为物化目标） |
 | `query_limit_exceeded` | 超出代价/规模上限 |
 | `concurrent_refresh` / `refresh_error` | 刷新/发布冲突 / 刷新失败 |
-| `version_not_found` / `version_evicted` | 口径版本从未发布 / 已按留存策略淘汰 |
+| `version_not_found` / `version_evicted` | 口径版本从未发布 / 已按留存策略淘汰（含对已淘汰版本的锁定或重交） |
 
 ## 验证方法
 
 ```bash
-uv run pytest -q                    # 53 项测试
+uv run pytest -q                    # 全部测试
 uv run pytest tests/test_scd.py     # 维度变更与迟到数据
 uv run pytest tests/test_materialization.py  # 并发刷新与失败原子性
-uv run pytest tests/test_versioning.py       # 版本留存、淘汰与拒绝
-uv run pytest tests/test_publish.py          # 原子发布与失败重试
+uv run pytest tests/test_versioning.py       # 版本留存、淘汰、淘汰边界并发读写
+uv run pytest tests/test_publish.py          # 原子发布、提交阶段失败无残留与重试
+uv run pytest tests/test_derived_publish.py  # 派生依赖整批切换、不可加派生拒绝
+uv run pytest tests/test_protect_version.py  # 发布后锁定与淘汰拒绝
 uv run pytest tests/test_non_additive.py     # 不可加度量派生拒绝
 ```
+
+关键场景与自动化用例对应关系：
+
+- **派生依赖整批切换**：`test_derived_publish.py`（随依赖整体切换、
+  旧版本逐行取回、重复提交/失败重跑与明细全量重算一致、并发读取不混版）。
+- **提交阶段失败的无残留与安全重试**：`test_publish.py` 中
+  `test_publish_rejected_when_one_channel_version_evicted` 等
+  （一路版本已淘汰则整批不生效，同号重试安全完成）。
+- **淘汰边界并发读写**：`test_versioning.py` 中
+  `test_eviction_boundary_concurrent_reads_complete_or_rejected` 与
+  `test_protected_lock_concurrent_never_evicted`（读要么完整要么被明确
+  拒绝，锁定版本连续淘汰下全程完整）。
+- **发布后锁定**：`test_protect_version.py`（锁定时机、永不淘汰、
+  超窗只淘汰非保护、`version_evicted` / `version_not_found` / 空结果
+  三类拒绝互不混淆）。
 
 测试日志（`test.evidence`）逐条打印每个用例的**输入**与**判定依据**，
 失败时可直接对照定位。HTTP 入口可用 `fastapi.testclient` 在本地完整复现，

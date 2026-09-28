@@ -18,7 +18,8 @@ class Engine:
         self.measures = measures
         self.store = DataStore()
         self.limits = LimitEnforcer(limits or QueryLimits())
-        self.materializations = MaterializationManager(self.store)
+        self.materializations = MaterializationManager(
+            self.store, measures=measures)
         self.planner = QueryPlanner(model, measures)
 
     def query(self, spec: QuerySpec) -> QueryResult:

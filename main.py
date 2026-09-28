@@ -95,6 +95,10 @@ class PublishRequest(BaseModel):
     items: list[PublishItemModel]
 
 
+class ProtectRequest(BaseModel):
+    version: str
+
+
 class IngestRequest(BaseModel):
     table: str
     partition: str
@@ -177,6 +181,13 @@ def read_materialization(name: str, version: str | None = None):
 @app.get("/materialization/{name}/versions")
 def materialization_versions(name: str):
     return engine.materializations.versions(name)
+
+
+@app.post("/materialization/{name}/protect")
+def protect_version(name: str, req: ProtectRequest):
+    """版本发布之后再锁定为受保护版本：锁定后永不淘汰。"""
+    engine.materializations.protect_version(name, req.version)
+    return {"target": name, "version": req.version, "protected": True}
 
 
 @app.post("/publish")

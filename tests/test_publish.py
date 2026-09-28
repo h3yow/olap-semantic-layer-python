@@ -12,7 +12,10 @@ from semantic_layer import (
     MaterializedAggregate,
     Measure,
     PublishItem,
+    RetentionPolicy,
+    VersionEvictedError,
 )
+from semantic_layer.materialization import MaterializationManager
 
 from .conftest import load_sales
 
@@ -191,3 +194,112 @@ def test_publish_conflicting_refresh_rejected(engine):
         release.set()
         t.join(timeout=5)
     mgr._compute_partition = orig
+
+
+def make_base_target(tname, version, column="amount"):
+    return MaterializedAggregate(
+        tname, Measure(tname, "fact_sales", column, Aggregation.SUM),
+        group_by=("cust_id",), partition_column="day", version=version)
+
+
+def test_publish_rejected_when_one_channel_version_evicted(engine):
+    """一路版本已超留存窗口：提交阶段整批拒绝，无部分更新，同号重试安全。"""
+    seed(engine)
+    mgr = MaterializationManager(
+        engine.store, RetentionPolicy(max_versions=2), measures=engine.measures)
+    # rev 路连续发布到 v3（v1 淘汰）；cost 路当前停在 v1
+    mgr.register(make_base_target("rev", "1"))
+    mgr.refresh("rev", [D1], batch_id="rev1")
+    mgr.register(make_base_target("rev", "2", column="net_amount"))
+    mgr.refresh("rev", [D1], batch_id="rev2")
+    mgr.register(make_base_target("rev", "3", column="net_cost"))
+    mgr.refresh("rev", [D1], batch_id="rev3")
+    mgr.register(make_base_target("cost", "1", column="cost"))
+    mgr.refresh("cost", [D1], batch_id="cost1")
+
+    before = mgr.read_set(["rev", "cost"])
+    before_currents = {n: mgr.versions(n)["current"] for n in ("rev", "cost")}
+
+    # 异常提交：rev 想用已淘汰的 v1（模拟月度对账拿旧窗口版本重交）
+    mgr.register(make_base_target("rev", "1", column="amount"))
+    mgr.register(make_base_target("cost", "2", column="net_cost"))
+    log.info("输入: 同批中 rev 路版本 v1 已淘汰、cost 路交 v2；"
+             "判定依据: 提交阶段拒绝 version_evicted，整批不生效")
+    with pytest.raises(VersionEvictedError) as ei:
+        mgr.publish("rel-bad", [PublishItem("rev", (D1,)),
+                                PublishItem("cost", (D1,))])
+    assert ei.value.code == "version_evicted"
+    assert ei.value.detail["version"] == "1"
+
+    # 无部分更新、无残留：两路可读结果与当前版本都保持原样
+    assert mgr.read_set(["rev", "cost"]) == before
+    assert {n: mgr.versions(n)["current"] for n in ("rev", "cost")} == \
+        before_currents
+    assert mgr.versions("rev")["retained"] == ["2", "3"]
+    assert mgr.versions("cost")["retained"] == ["1"]
+    # 失败的 release 未登记
+    assert "rel-bad" not in mgr._applied_releases
+
+    # 把 rev 改回合法的新版本 v4 后，用同一 release_id 原样重试可安全完成
+    mgr.register(make_base_target("rev", "4", column="amount"))
+    report = mgr.publish("rel-bad", [PublishItem("rev", (D1,)),
+                                     PublishItem("cost", (D1,))])
+    log.info("判定依据: 修正后同号重试成功 %s；rev v4 触发淘汰但 cost 完整",
+             report.versions)
+    assert not report.skipped
+    after = mgr.read_set(["rev", "cost"])
+    assert {r["__version__"] for r in after["rev"]} == {"4"}
+    assert {r["__version__"] for r in after["cost"]} == {"2"}
+    # rev：max_versions=2，v3/v4 留存；cost：v1/v2 留存
+    assert mgr.versions("rev")["retained"] == ["3", "4"]
+    assert mgr.versions("cost")["retained"] == ["1", "2"]
+    # 再重复提交同号 release：幂等
+    again = mgr.publish("rel-bad", [PublishItem("rev", (D1,)),
+                                    PublishItem("cost", (D1,))])
+    assert again.skipped
+    assert mgr.read_set(["rev", "cost"]) == after
+
+
+def test_publish_rejected_then_same_release_retryable_with_fixed_items(engine):
+    """失败后原样重试的另一种形态：同 release_id 换合法内容后完成并可重复跳过。"""
+    seed(engine)
+    mgr = MaterializationManager(
+        engine.store, RetentionPolicy(max_versions=2), measures=engine.measures)
+    mgr.register(make_base_target("rev", "1"))
+    mgr.refresh("rev", [D1], batch_id="rev1")
+    mgr.register(make_base_target("rev", "2", column="net_amount"))
+    mgr.refresh("rev", [D1], batch_id="rev2")
+    mgr.register(make_base_target("rev", "3", column="net_cost"))
+    mgr.refresh("rev", [D1], batch_id="rev3")
+    mgr.register(make_base_target("cost", "1", column="cost"))
+    mgr.refresh("cost", [D1], batch_id="cost1")
+
+    mgr.register(make_base_target("rev", "1", column="amount"))
+    mgr.register(make_base_target("cost", "2", column="net_cost"))
+    with pytest.raises(VersionEvictedError):
+        mgr.publish("rel-fix", [PublishItem("rev", (D1,)),
+                                PublishItem("cost", (D1,))])
+    log.info("输入: rel-fix 首次因版本淘汰失败；判定依据: 失败 release 未登记，"
+             "可同号换合法内容重试")
+    mgr.register(make_base_target("rev", "4", column="amount"))
+    rep = mgr.publish("rel-fix", [PublishItem("rev", (D1,)),
+                                  PublishItem("cost", (D1,))])
+    assert not rep.skipped
+    assert mgr.publish("rel-fix", [PublishItem("rev", (D1,)),
+                                   PublishItem("cost", (D1,))]).skipped
+
+
+def test_refresh_rejected_when_version_evicted(engine):
+    """单目标刷新到已淘汰版本同样在提交前拒绝，状态不变。"""
+    seed(engine)
+    mgr = MaterializationManager(
+        engine.store, RetentionPolicy(max_versions=1), measures=engine.measures)
+    mgr.register(make_base_target("rev", "1"))
+    mgr.refresh("rev", [D1], batch_id="r1")
+    mgr.register(make_base_target("rev", "2", column="net_amount"))
+    mgr.refresh("rev", [D1], batch_id="r2")
+    log.info("输入: v1 已淘汰后以 v1 重注册并刷新；判定依据: 拒绝且当前仍为 v2")
+    mgr.register(make_base_target("rev", "1", column="amount"))
+    with pytest.raises(VersionEvictedError):
+        mgr.refresh("rev", [D1], batch_id="r1-retry")
+    assert mgr.versions("rev")["current"] == "2"

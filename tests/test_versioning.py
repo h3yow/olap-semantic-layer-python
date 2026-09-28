@@ -179,3 +179,96 @@ def test_eviction_and_read_concurrent_safe(engine):
     for v in tl["retained"]:
         rows = mgr.read("agg", version=v)
         assert all(r["__version__"] == v for r in rows)
+
+
+def test_eviction_boundary_concurrent_reads_complete_or_rejected(engine):
+    """淘汰边界并发：读者要么完整取到整套版本结果，要么被明确拒绝；
+    读到的当前版本始终是完整一套（单目标场景下即该版本全部行）。"""
+    seed(engine)
+    mgr = MaterializationManager(engine.store, RetentionPolicy(max_versions=2))
+    for v in ("1", "2"):
+        mgr.register(make_target(v))
+        mgr.refresh("agg", [D1, D2], batch_id=f"r{v}")
+    # 两个留存版本的完整期望
+    expected = {v: key_rows(mgr.read("agg", version=v)) for v in ("1", "2")}
+
+    stop = threading.Event()
+    errors: list[Exception] = []
+    states: set = set()
+
+    def reader():
+        while not stop.is_set():
+            try:
+                rows = mgr.read("agg")  # 当前对外版本
+                got = key_rows(rows)
+                ver = {r[3] for r in got}
+                assert len(ver) == 1, f"当前结果混入多版本: {ver}"
+                states.add(next(iter(ver)))
+                v = next(iter(ver))
+                if v in expected:
+                    assert got == expected[v]
+            except VersionEvictedError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+    def publisher():
+        for i in range(3, 13):
+            mgr.register(make_target(str(i)))
+            mgr.refresh("agg", [D1], batch_id=f"r{i}")
+
+    threads = [threading.Thread(target=reader) for _ in range(4)]
+    for t in threads:
+        t.start()
+    publisher()
+    stop.set()
+    for t in threads:
+        t.join(timeout=10)
+    log.info("输入: 4 读者并发读当前版本、同时发布 v3..v12 跨越淘汰边界；"
+             "判定依据: 无损坏、无混版本，观察到的版本集合=%s，错误=%s",
+             sorted(states), errors)
+    assert errors == []
+    tl = mgr.versions("agg")
+    assert len(tl["retained"]) == 2
+    for v in tl["retained"]:
+        assert all(r["__version__"] == v for r in mgr.read("agg", version=v))
+
+
+def test_protected_lock_concurrent_never_evicted(engine):
+    """发布后锁定的版本在连续淘汰下始终完整可读（并发读写）。"""
+    seed(engine)
+    mgr = MaterializationManager(engine.store, RetentionPolicy(max_versions=2))
+    for v in ("1", "2"):
+        mgr.register(make_target(v))
+        mgr.refresh("agg", [D1, D2], batch_id=f"r{v}")
+    mgr.protect_version("agg", "1")
+    locked_rows = key_rows(mgr.read("agg", version="1"))
+
+    stop = threading.Event()
+    errors: list[Exception] = []
+
+    def reader():
+        while not stop.is_set():
+            try:
+                if key_rows(mgr.read("agg", version="1")) != locked_rows:
+                    errors.append(AssertionError("锁定版本读到不完整结果"))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+    def publisher():
+        for i in range(3, 10):
+            mgr.register(make_target(str(i)))
+            mgr.refresh("agg", [D1], batch_id=f"r{i}")
+
+    threads = [threading.Thread(target=reader) for _ in range(3)]
+    for t in threads:
+        t.start()
+    publisher()
+    stop.set()
+    for t in threads:
+        t.join(timeout=10)
+    log.info("输入: 锁定 v1 后并发发布 v3..v9；判定依据: v1 全程完整、错误=%s",
+             errors)
+    assert errors == []
+    assert "1" in mgr.versions("agg")["retained"]
+    assert key_rows(mgr.read("agg", version="1")) == locked_rows

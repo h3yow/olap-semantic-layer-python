@@ -83,3 +83,63 @@ def test_version_not_found_distinct(client):
     res = client.get("/materialization/revenue_by_region?version=99")
     assert res.status_code == 404
     assert res.json()["error"]["code"] == "version_not_found"
+
+
+def test_publish_derived_and_protect_endpoint(client):
+    """派生目标随同一批发布取数；发布后锁定端点可用，错误状态码分类正确。"""
+    import main
+    from semantic_layer import MaterializedAggregate
+
+    mgr = main.engine.materializations
+    mgr.register(MaterializedAggregate(
+        "profit_by_customer", "profit", group_by=("cust_id",),
+        partition_column="day", version="1"))
+    log.info("输入: ingest 后同批发布 revenue 基础目标与 profit 派生目标")
+    client.post("/ingest", json={
+        "table": "fact_sales", "partition": "2026-05-31", "batch_id": "api-dp1",
+        "rows": [{"id": 970, "cust_id": "c9", "day": "2026-05-01",
+                  "amount": 10.0, "cost": 4.0, "__row_key__": "api-dp1"}],
+    })
+    res = client.post("/publish", json={
+        "release_id": "rel-api-derived",
+        "items": [
+            {"target": "revenue_by_region", "partitions": ["2026-05-01"]},
+            {"target": "profit_by_customer", "partitions": ["2026-05-01"]},
+        ],
+    })
+    assert res.status_code == 200
+    rows = client.get("/materialization/profit_by_customer").json()["rows"]
+    by_cust = {r["cust_id"]: r["profit"] for r in rows if r["cust_id"] == "c9"
+               and r["day"] == "2026-05-01"}
+    assert by_cust == {"c9": 6.0}
+    log.info("判定依据: 派生结果按依赖推导 profit=10-4=6: %s", by_cust)
+
+    # 发布之后再锁定
+    locked = client.post("/materialization/profit_by_customer/protect",
+                         json={"version": "1"})
+    assert locked.status_code == 200 and locked.json()["protected"] is True
+    tl = client.get("/materialization/profit_by_customer/versions").json()
+    assert "1" in tl["locked"]
+    log.info("判定依据: 发布后锁定成功，时间线 locked=%s", tl["locked"])
+
+    # 锁定从未发布的版本 -> 404 version_not_found
+    missing = client.post("/materialization/profit_by_customer/protect",
+                          json={"version": "99"})
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "version_not_found"
+
+
+def test_derived_non_additive_rejected_over_http(client):
+    """不可加派生目标经注册期拦截，API 返回可分类错误码。"""
+    import main
+    from semantic_layer import DerivedMeasure, MaterializedAggregate
+
+    main.engine.measures.register_derived(DerivedMeasure(
+        "api_apb", "revenue / buyers", ("revenue", "buyers")))
+    log.info("输入: HTTP 层物化不可加派生 api_apb；判定依据: 400 + "
+             "non_additive_aggregation")
+    with pytest.raises(Exception) as ei:
+        main.engine.materializations.register(MaterializedAggregate(
+            "api_apb_agg", "api_apb", group_by=("cust_id",),
+            partition_column="day"))
+    assert ei.value.code == "non_additive_aggregation"
