@@ -51,6 +51,41 @@ class VersionTimeline:
         self.published_order: list[str] = []      # 按发布先后排列的现存版本
         self.current: str | None = None           # 当前对外版本
         self.evicted: dict[str, EvictionRecord] = {}
+        # 发布后运行时锁定的受保护版本（区别于建策略时的静态保护名单）
+        self.protected: set[str] = set()
+
+    def clone(self) -> "VersionTimeline":
+        """复制一份时间线，供两阶段提交在副本上预演（不影响线上状态）。"""
+        clone = VersionTimeline()
+        clone.published_order = list(self.published_order)
+        clone.current = self.current
+        clone.evicted = dict(self.evicted)
+        clone.protected = set(self.protected)
+        return clone
+
+    def protect(self, version: str) -> None:
+        """发布后把一个现存版本锁定为受保护版本。
+
+        锁定是持久的：之后无论再发布多少版本都不淘汰它。
+        已淘汰版本 -> VersionEvictedError；从未发布 -> VersionNotFoundError，
+        与读取路径的拒绝原因完全一致，便于调用方区分处理。
+        """
+        if version in self.published_order:
+            self.protected.add(version)
+            return
+        if version in self.evicted:
+            rec = self.evicted[version]
+            raise VersionEvictedError(
+                f"口径版本 {version} 已按留存策略淘汰（{rec.reason}），"
+                "无法再锁定为受保护版本",
+                detail={"version": version, "reason": rec.reason,
+                        "evicted_after_publish": rec.evicted_after_publish})
+        raise VersionNotFoundError(
+            f"口径版本 {version} 从未发布过，无法锁定",
+            detail={"version": version, "available": list(self.published_order)})
+
+    def is_protected(self, version: str, policy: RetentionPolicy) -> bool:
+        return version in policy.protected or version in self.protected
 
     def publish(self, version: str) -> None:
         """登记一次发布。重复发布同一版本幂等（不重复计入留存数）。"""
@@ -66,7 +101,10 @@ class VersionTimeline:
     def evictions_for(self, policy: RetentionPolicy) -> list[str]:
         """按策略计算应淘汰的版本：超出的部分按发布先后取最旧的非保护版本。
 
-        保护名单与当前对外版本永不淘汰（保护优先于上限）。
+        保护来源有两处且等效：建策略时声明的静态保护名单，与发布后通过
+        protect() 运行时锁定的版本。保护优先于上限——若现存版本全部受保护，
+        则一个都不淘汰（实际保留数可能超过 max_versions）。当前对外版本
+        同样永不淘汰。
         """
         if policy.max_versions is None:
             return []
@@ -77,7 +115,7 @@ class VersionTimeline:
         for v in self.published_order:  # 最旧的在前
             if len(victims) >= excess:
                 break
-            if v in policy.protected or v == self.current:
+            if self.is_protected(v, policy) or v == self.current:
                 continue
             victims.append(v)
         return victims

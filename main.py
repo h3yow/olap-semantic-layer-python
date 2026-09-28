@@ -179,6 +179,17 @@ def materialization_versions(name: str):
     return engine.materializations.versions(name)
 
 
+class ProtectRequest(BaseModel):
+    version: str
+
+
+@app.post("/materialization/{name}/protect")
+def protect_version(name: str, req: ProtectRequest):
+    """发布完成后把版本锁定为受保护版本（月度审计锁定）。"""
+    engine.materializations.protect_version(name, req.version)
+    return {"target": name, "version": req.version, "protected": True}
+
+
 @app.post("/publish")
 def publish(req: PublishRequest):
     items = [PublishItem(it.target, tuple(date.fromisoformat(p)

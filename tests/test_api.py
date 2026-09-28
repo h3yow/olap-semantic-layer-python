@@ -83,3 +83,28 @@ def test_version_not_found_distinct(client):
     res = client.get("/materialization/revenue_by_region?version=99")
     assert res.status_code == 404
     assert res.json()["error"]["code"] == "version_not_found"
+
+
+def test_protect_version_after_publish(client):
+    log.info("输入: 发布后 POST /protect 锁定 v1；"
+             "判定依据: 200 且 versions.protected 含 v1；锁未知版本 404")
+    client.post("/ingest", json={
+        "table": "fact_sales", "partition": "2026-05-31", "batch_id": "api-lock",
+        "rows": [{"id": 960, "cust_id": "c9", "day": "2026-05-01",
+                  "amount": 5.0, "cost": 1.0, "__row_key__": "api-lock"}],
+    })
+    client.post("/publish", json={
+        "release_id": "rel-lock-1",
+        "items": [{"target": "revenue_by_region", "partitions": ["2026-05-01"]}],
+    })
+    res = client.post("/materialization/revenue_by_region/protect",
+                      json={"version": "1"})
+    assert res.status_code == 200
+    assert res.json()["protected"] is True
+    tl = client.get("/materialization/revenue_by_region/versions").json()
+    assert "1" in tl["protected"]
+
+    missing = client.post("/materialization/revenue_by_region/protect",
+                          json={"version": "77"})
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "version_not_found"
